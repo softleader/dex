@@ -2,7 +2,8 @@ ARG BASE_IMAGE=alpine
 
 FROM --platform=$BUILDPLATFORM tonistiigi/xx:1.4.0@sha256:0cd3f05c72d6c9b038eb135f91376ee1169ef3a330d34e418e65e2a5c2e9c0d4 AS xx
 
-FROM --platform=$BUILDPLATFORM golang:1.22.3-alpine3.18@sha256:d1a601b64de09e2fa38c95e55838961811d5ca11062a8f4230a5c434b3ae2a34 AS builder
+# Go 1.26.10 includes the crypto/x509 fix for CVE-2026-111943.
+FROM --platform=$BUILDPLATFORM golang:1.26.10-alpine3.23@sha256:34414731924cf2263160f0021f5cf6e1807382d85248f7cb419d4187b96d5e43 AS builder-base
 
 COPY --from=xx / /
 
@@ -17,11 +18,14 @@ RUN [ "$(xx-info arch)" != "ppc64le" ] || XX_CC_PREFER_LINKER=ld xx-clang --setu
 
 RUN xx-go --wrap
 
-WORKDIR /usr/local/src/dex
-
 ARG GOPROXY
 
 ENV CGO_ENABLED=1
+ENV GOTOOLCHAIN=local
+
+FROM builder-base AS builder
+
+WORKDIR /usr/local/src/dex
 
 COPY go.mod go.sum ./
 COPY api/v2/go.mod api/v2/go.sum ./api/v2/
@@ -35,26 +39,28 @@ RUN make release-binary
 
 RUN xx-verify /go/bin/dex && xx-verify /go/bin/docker-entrypoint
 
-FROM alpine:3.20.0@sha256:77726ef6b57ddf65bb551896826ec38bc3e53f75cdde31354fbffb4f25238ebd AS stager
+FROM alpine:3.23.7@sha256:ff7f0c727dd796aa36787bfcd9a64bf35a6ce72a73451b3359fde849b6703d63 AS stager
 
 RUN mkdir -p /var/dex
 RUN mkdir -p /etc/dex
 COPY config.docker.yaml /etc/dex/
 
-FROM alpine:3.20.0@sha256:77726ef6b57ddf65bb551896826ec38bc3e53f75cdde31354fbffb4f25238ebd AS gomplate
-
-ARG TARGETOS
-ARG TARGETARCH
-ARG TARGETVARIANT
+FROM builder-base AS gomplate
 
 ENV GOMPLATE_VERSION=v3.11.8
 
-RUN wget -O /usr/local/bin/gomplate \
-  "https://github.com/hairyhenderson/gomplate/releases/download/${GOMPLATE_VERSION}/gomplate_${TARGETOS:-linux}-${TARGETARCH:-amd64}${TARGETVARIANT}" \
-  && chmod +x /usr/local/bin/gomplate
+WORKDIR /usr/local/src/gomplate
+
+# Rebuild the existing gomplate version with the patched Go toolchain too;
+# the upstream release binary still embeds a vulnerable standard library.
+RUN git clone --depth 1 --branch "${GOMPLATE_VERSION}" https://github.com/hairyhenderson/gomplate.git . \
+  && CGO_ENABLED=0 go build -trimpath \
+    -ldflags "-w -s -X github.com/hairyhenderson/gomplate/v3/version.Version=${GOMPLATE_VERSION#v} -X github.com/hairyhenderson/gomplate/v3/version.GitCommit=$(git rev-parse HEAD)" \
+    -o /go/bin/gomplate ./cmd/gomplate \
+  && xx-verify /go/bin/gomplate
 
 # For Dependabot to detect base image versions
-FROM alpine:3.20.0@sha256:77726ef6b57ddf65bb551896826ec38bc3e53f75cdde31354fbffb4f25238ebd AS alpine
+FROM alpine:3.23.7@sha256:ff7f0c727dd796aa36787bfcd9a64bf35a6ce72a73451b3359fde849b6703d63 AS alpine
 FROM gcr.io/distroless/static-debian12:nonroot@sha256:e9ac71e2b8e279a8372741b7a0293afda17650d926900233ec3a7b2b7c22a246 AS distroless
 
 FROM $BASE_IMAGE
@@ -77,7 +83,7 @@ COPY --from=builder /go/bin/dex /usr/local/bin/dex
 COPY --from=builder /go/bin/docker-entrypoint /usr/local/bin/docker-entrypoint
 COPY --from=builder /usr/local/src/dex/web /srv/dex/web
 
-COPY --from=gomplate /usr/local/bin/gomplate /usr/local/bin/gomplate
+COPY --from=gomplate /go/bin/gomplate /usr/local/bin/gomplate
 
 USER 1001:1001
 
